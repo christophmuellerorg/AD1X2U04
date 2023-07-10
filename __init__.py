@@ -1,4 +1,5 @@
 import math
+import time
 
 class AD122U04(object):
 
@@ -24,6 +25,7 @@ class AD122U04(object):
         """
         self.serial = serial
         self.serial.open()
+        self._query_drdy_pin_function=None
     
     # Valid MUX configurations
     MUX_CTRL = {
@@ -177,7 +179,7 @@ class AD122U04(object):
             if the data rate is not supported in either normal 
             or turbo mode
         """
-        reg_1 = self.read_reg(0) & 0x0f
+        reg_1 = self.read_reg(1) & 0x0f
         if dr in self.DATA_RATES_NORMAL_MODE:
             drv = self.DATA_RATES_NORMAL_MODE[dr]
             self.write_reg(1,(drv<<5) | reg_1)
@@ -194,7 +196,7 @@ class AD122U04(object):
             (data rate, turbo mode)
 
         """
-        reg_1 = (self.read_reg(0) & 0xf0) >> 4
+        reg_1 = (self.read_reg(1) & 0xf0) >> 4
         turbomode = bool(reg_1 & 0x1)
         drv = reg_1 >> 1
         dr = 0
@@ -244,15 +246,138 @@ class AD122U04(object):
         for key, value in self.VREF.items():
             if value == vref:
                 return key
-        
+
+    def read_temperature(self):
+        """
+        Reads the temperature sensor integrated in the ADC
+
+        Returns
+        -------
+        Temperature in degrees C
+        """
+        reg_1 = self.read_reg(1)
+        # enable TS mode
+        self.write_reg(1, reg_1 | 0x1)
+        self.start()
+        self.wait_valid_data()
+        t_data = (self.read_data()>>(self.READ_DATA_BITS-14))*0.03125
+        # disable TS mode
+        self.write_reg(1, reg_1)
+        return t_data
+
+    GPIO_DATA = {
+        2: 0x4,
+        1: 0x2,
+        0: 0x1
+    }
     def set_gpio(self,io, value):
-        pass
+        """
+        Sets the GPIO to a value
+
+        Parameters
+        ----------
+        io : int
+            The GPIO to control
+        value : int
+            The GPIO value to set
+        """
+        if io not in self.GPIO_DATA.keys():
+            raise ValueError("GPIO must be on of 0, 1, or 2.")
+        if value not in [0,1]:
+            raise ValueError("Invalid value, must be one of [0,1]")
+        reg_4 = self.read_reg(4) & (0xff^self.GPIO_DATA[io])
+        if value:
+            reg_4 |= self.GPIO_DATA[io]
+        self.write_reg(4, reg_4)
+
+    GPIO_DIR = {
+        2: 0x40,
+        1: 0x20,
+        0: 0x10
+    }           
+
+    GPIO_DIR_INPUT = 0
+    GPIO_DIR_OUTPUT = 1
 
     def set_gpio_dir(self, io, dir):
-        pass
+        """
+        Sets the direction of a GPIO
+
+        Parameters
+        ----------
+        io : int
+            One of [0,1,2] - the GPIO to use
+        dir: int 
+            0: Input
+            1: Output
+
+        Raises
+        ------
+        ValueError
+            If io is not in [0,1,2] or dir is not in [0,1]
+        """
+        if io not in self.GPIO_DIR.keys():
+            raise ValueError("GPIO must be on of 0, 1, or 2.")
+        if dir not in [0,1]:
+            raise ValueError("Invalid direction. Valid driections: 0 for input, 1 for output.")
+        reg_4 = self.read_reg(4)
+        if dir: 
+            self.write_reg(4, reg_4|self.GPIO_DIR[io])
+        else:
+            self.write_reg(4, reg_4&(0xff^self.GPIO_DIR[io]))
+
 
     def get_gpio(self, io):
-        pass
+        """
+        Returns the GPIO value
+
+        Parameters
+        ----------
+        io : int
+            One of [0,1,2] - the GPIO to use
+
+        Returns
+        -------
+        int
+            1 if IO is set
+            0 otherwise
+
+        Raises
+        ------
+        ValueError
+            If io is not in [0,1,2]
+        """
+        if io not in self.GPIO_DATA.keys():
+            raise ValueError("GPIO outside valid range")
+        if self.read_reg(4)|self.GPIO_DATA[io]:
+            return 1
+        return 0
+
+    def get_gpio_dir(self, io):
+        """
+        Returns the GPIO dirction
+
+        Parameters
+        ----------
+        io : int
+            One of [0,1,2] - the GPIO to use
+
+        Returns
+        -------
+        int
+            0: Input
+            1: Output
+
+        Raises
+        ------
+        ValueError
+            If io is not in [0,1,2]
+        """
+        if io not in self.GPIO_DIR.keys():
+            raise ValueError("GPIO outside valid range")
+        if self.read_reg(4) & self.GPIO_DIR[io]:
+            return self.GPIO_DIR_OUTPUT
+        return self.GPIO_DIR_INPUT
 
     def reset(self):
         self.serial.write(bytearray([self.CMD_SYNC, self.CMD_RESET]))
@@ -301,10 +426,94 @@ class AD122U04(object):
         data = self.serial.read(self.READ_DATA_BYTES)
         return data
     
-    def read_data(self):
-        self.start()
-        data = self.read_raw_data()
-        return int.from_bytes(data,'little',signed=True)
+    def read_data(self, count=1):
+        if count ==1:
+            self.start()
+            self.wait_valid_data()
+            data = self.read_raw_data()
+            return int.from_bytes(data,'little',signed=True)
+        else:
+            reg_1 = self.read_reg(1)
+            reg_3 = self.read_reg(3)
+            # start automatic mode
+            data = []
+            self.write_reg(1, reg_1 | 0x8)
+            self.write_reg(3, reg_3 | 0x1)
+            self.start()
+            for i in range(0,count):
+                data.append(int.from_bytes(self.serial.read(self.READ_DATA_BYTES),'little',signed=True))
+            #turn off automatic mode
+            self.powerdown()
+            self.write_reg(3, reg_3 & 0xfe)
+            self.write_reg(1, reg_1 & 0xf7)
+            # wait for data transmit to finish and drop all data which might 
+            # have arrived after our sampling period
+            time.sleep(.1)
+            self.serial.flush()
+            return data
+
+    def read_data_normalised(self):
+        """
+        Helper function returning data normalized with 2.0**READ_DATA_BITS, 
+        allowing for identically scaled data between AD112U04 and AD122U04
+        designs
+        """
+        self.read_data()/(2.0**self.READ_DATA_BITS)
+
+    def set_query_drdy_funtion(self, funcptr):
+        """
+        Helper function allowing to configure a call to an external function 
+        to read the DRDY GPIO pin rather than querying the register. When 
+        providing a function pointer GPIO pin 2 is also configured to provide 
+        the DRDY output.  
+        
+        PARAMETERS
+        ----------
+        funcptr : function
+            Function pointer to a function that monitors the GPIO DRDY signal,
+            returning True when new data is available. Set to None to return to 
+            register querying and reconfigure the DRDY to function as GPIO 2.
+        """
+        reg_4 = self.read_reg(4)
+
+        if funcptr == None:
+            # configure the DRDY pin as GPIO
+            self.write_reg(reg4 & 0xf7)
+        else:
+            # configure the DRDY pin to provide DRDY
+            self.write_reg(reg4 | 0x8)
+
+        self._query_drdy_pin_function = funcptr
+    
+    def wait_valid_data(self, timeout=100):
+        """
+        Function to wait for valid data. If a function to query the drdy GPIO has 
+        been defined the function is called repeatedly until true, otherwise the 
+        DRDY register bit is querried.
+
+        Parameters
+        ----------
+        timeout : int
+            When a query function is defined: the function is called up to 100 times,
+            with a 1ms delay between the tries. If the status register is used
+            timeout represents the maximum number of register queries.
+        """
+        if self._query_drdy_pin_function==None:
+            while True:
+                if self.read_reg(2) & 0x80:
+                    break
+                timeout -= 1
+                if timeout == 0:
+                    break
+        else:
+            while True:
+                if self._query_drdy_pin_function():
+                    break
+                time.sleep(0.001)
+                timeout -= 1
+                if timeout == 0:
+                    break
+
 
 # untested, but should work as the part is very similar, except for 2 instead of 3 data bytes
 class AD112U04(AD122U04):
