@@ -231,7 +231,7 @@ class AD122U04(object):
         ValueError
 
         """
-        reg_1 = (self.read_reg(0) & 0xf1)
+        reg_1 = (self.read_reg(1) & 0xf1)
         if value in self.VREF:
             self.write_reg(1, reg_1 | (self.VREF[value] << 1))
         else:
@@ -240,7 +240,7 @@ class AD122U04(object):
     def get_vref(self):
         """ 
         """
-        vref = (self.read_reg(0) & 0x07) >> 1
+        vref = (self.read_reg(1) & 0x07) >> 1
         if vref == 0x3:
             vref = 0x2
         for key, value in self.VREF.items():
